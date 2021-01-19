@@ -29,7 +29,9 @@
     },
     "homepage": "https://github.com/odrick/webpack-free-tex-packer#readme",
     "dependencies": {
-        "chokidar": "^2.0.4",
         "free-tex-packer-core": "^0.3.2"
-    }
+    },
+	"peerDependencies": {
+		"webpack": "5.x"
+	}
 }

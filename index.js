@@ -1,189 +1,113 @@
+"use strict";
+
 const fs = require('fs');
-const pathModule = require('path');
-const chokidar = require('chokidar');
+const path = require('path');
 const texturePacker = require('free-tex-packer-core');
 const appInfo = require('./package.json');
 
-const SUPPORTED_EXT = ['png', 'jpg', 'jpeg'];
+const supportedExtensions = ['.png', '.jpg', '.jpeg'];
 
-function isFolder(path) {
-    if(isExists(path)) {
-        return fs.statSync(path).isDirectory();
-    }
-    else {
-        path = fixPath(path);
-        let name = getNameFromPath(path);
-        let parts = name.split('.');
-        return parts.length === 1;
-    }
+function removePrefix(s, prefix) {
+	return s.startsWith(prefix) ? s.slice(prefix.length) : s;
 }
 
-function isExists(path) {
-    return fs.existsSync(path);
-}
+/**
+ * Returns all entries of the specified directory recursively.
+ *
+ * All returned paths are normalized.
+ *
+ * @param dir The parent directory in question.
+ * @param list The later returned array that entries are added to.
+ * @return All directories and files in the directory as Dirent:s.
+ */
+function getDirectoryEntriesRec(dir, list = []) {
+	for (let dirent of fs.readdirSync(dir, {withFileTypes: true})) {
+		let entryPath = path.join(dir, dirent.name);
+		list.push({
+			path: entryPath,
+			isDirectory: dirent.isDirectory(),
+		});
+		if (dirent.isDirectory())
+			getDirectoryEntriesRec(entryPath, list);
+	}
 
-function fixPath(path) {
-    return path.trim().split('\\').join('/');
-}
-
-function getNameFromPath(path) {
-    return path.trim().split('/').pop();
-}
-
-function getExtFromPath(path) {
-    return path.trim().split('.').pop().toLowerCase();
-}
-
-function getFolderFilesList(dir, base = '', list = []) {
-    let files = fs.readdirSync(dir);
-    for(let file of files) {
-        let path = pathModule.resolve(dir, file);
-        if(isFolder(path) && path.toUpperCase().indexOf('__MACOSX') < 0) {
-            list = getFolderFilesList(path, base + file + '/', list);
-        }
-        else {
-            list.push({
-                name: (base ? base : '') + file,
-                path: path
-            });
-        }
-    }
-
-    return list;
-}
-
-function getSubFoldersList(dir, list = []) {
-    let files = fs.readdirSync(dir);
-    for(let file of files) {
-        let path = pathModule.resolve(dir, file);
-        if(isFolder(path) && path.toUpperCase().indexOf('__MACOSX') < 0) {
-            list.push(path);
-            list = getSubFoldersList(path, list);
-        }
-    }
-
-    return list;
+	return list
 }
 
 class WebpackFreeTexPacker {
     constructor(src, dest = '.', options = {}) {
-        if(!Array.isArray(src)) src = [src];
-
-        this.src = src;
+        this.src = Array.isArray(src) ? src : [src];
         this.dest = dest;
 
         this.options = options;
         this.options.appInfo = appInfo;
 
-        this.changed = true;
-
-        this.watcher = null;
-        this.watchStarted = false;
-
-        this.onFsChanges = this.onFsChanges.bind(this);
-    }
-
-    addDependencie(dependencies, path) {
-        if(Array.isArray(dependencies)) dependencies.push(path);
-        else dependencies.add(path);
-
-        this.addToWatch(path);
-    }
-
-    addToWatch(path) {
-        if(!this.watcher) {
-            this.watcher = chokidar.watch(path, {ignoreInitial: true});
-            this.watcher.on('all', this.onFsChanges);
-        }
-        else {
-            this.watcher.add(path);
-        }
-    }
-
-    onFsChanges() {
-        this.changed = true;
+		this.prevFiles = new Set();
     }
 
     apply(compiler) {
-        if (compiler.hooks && compiler.hooks.emit) {
-            // Webpack 4
-            compiler.hooks.emit.tapAsync('WebpackFreeTexPacker', this.emitHookHandler.bind(this));
-        } else {
-            // Webpack 3
-            compiler.plugin('emit', this.emitHookHandler.bind(this))
-        }
-    }
+		compiler.hooks.emit.tapAsync('WebpackFreeTexPacker', this.emitHookHandler.bind(this));
+	}
 
-    emitHookHandler(compilation, callback) {
-        let files = {};
+	emitHookHandler(compilation, callback) {
+		const compiler = compilation.compiler;
+		
+		let files = new Set();
+		for(let srcPath of this.src) {
+			srcPath = path.normalize(srcPath);
+			if (!fs.existsSync(srcPath)) throw new Error(`Path ${srcPath} does not exist`)
 
-        if(!compilation.options || compilation.options.mode === 'development') {
-            for(let srcPath of this.src) {
-                let path = fixPath(srcPath);
+			if (fs.statSync(srcPath).isDirectory()) {
+				compilation.contextDependencies.add(srcPath);
 
-                let name = getNameFromPath(path);
+				for (let {path: subPath, isDirectory} of getDirectoryEntriesRec(srcPath)) {
+					if (isDirectory) {
+						compilation.contextDependencies.add(subPath);
+					} else {
+						let extension = path.extname(subPath);
+						if (supportedExtensions.includes(extension.toLowerCase())) {
+							// Paths are normalized: Get base path by removing prefix string
+							files.add({path: subPath, name: removePrefix(subPath, srcPath + path.sep)});
+						}
 
-                if(name === '.' || name === '*' || name === '*.*') {
-                    srcPath = srcPath.substr(0, srcPath.length - name.length - 1);
-                    path = fixPath(srcPath);
-                    name = '';
-                }
+						compilation.fileDependencies.add(subPath);
+					}
+				}
+			} else {
+				files.add({path: srcPath, name: path.basename(srcPath)});
+				compilation.fileDependencies.add(srcPath);
+			}
+		}
 
-                if(isFolder(path)) {
-                    if(isExists(srcPath)) {
-                        let list = getFolderFilesList(path, (name ? name + '/' : ''));
-                        for(let file of list) {
-                            let ext = getExtFromPath(file.path);
-                            if(SUPPORTED_EXT.indexOf(ext) >= 0) files[file.name] = file.path;
-                        }
-                    }
+		let changed = files.size != this.prevFiles.size
+			|| Array.from(files).some(({path: file}) =>
+				!this.prevFiles.has(file) || compiler.modifiedFiles.has(file));
+		if (!changed || files.size === 0) {
+			callback();
+			return;
+		}
+		this.prevFiles = new Set(Array.from(files).map(({path: file}) => file));
 
-                    this.addDependencie(compilation.contextDependencies, srcPath);
+		let images = Array.from(files)
+			.map(({path: file, name}) => ({
+				path: name,
+				contents: fs.readFileSync(file),
+			}));
 
-                    let subFolders = getSubFoldersList(srcPath);
-                    for(let folder of subFolders) {
-                        this.addDependencie(compilation.contextDependencies, folder);
-                    }
-                }
-                else {
-                    if(isExists(srcPath)) {
-                        files[getNameFromPath(path)] = path;
-                    }
+        texturePacker(images, this.options, (files, error) => {
+			if (error) {
+				compilation.errors.push(error);
+			} else {
+				for (let {name, buffer} of files) {
+					compilation.emitAsset(`${this.dest}/${name}`, {
+						source() { return buffer; },
+						size() { return buffer.length; },
+					});
+				}
+			}
 
-                    this.addDependencie(compilation.fileDependencies, srcPath);
-                }
-            }
-        }
-
-        if(this.watchStarted && !this.changed) {
-            callback();
-            return;
-        }
-
-        let images = [];
-        let names = Object.keys(files);
-        for(let name of names) {
-            images.push({path: name, contents: fs.readFileSync(files[name])});
-        }
-
-        texturePacker(images, this.options, (files) => {
-            for(let item of files) {
-                (function(item, dest) {
-                    compilation.assets[dest + '/' + item.name] = {
-                        source: function() {
-                            return item.buffer;
-                        },
-                        size: function() {
-                            return item.buffer.length;
-                        }
-                    };
-                })(item, this.dest);
-            }
             callback();
         });
-
-        this.changed = false;
-        this.watchStarted = true;
     }
 }
 
